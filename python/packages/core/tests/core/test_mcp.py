@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Mapping
 from contextlib import AbstractAsyncContextManager, _AsyncGeneratorContextManager  # type: ignore
 from contextvars import ContextVar
 from textwrap import dedent
@@ -6732,10 +6732,129 @@ async def test_mcp_streamable_http_tool_get_mcp_client_all_params():
             assert mock_http_client.call_args.kwargs["http_client"]._client is http_client
             assert mock_http_client.call_args.kwargs["url"] == "http://example.com"
             assert mock_http_client.call_args.kwargs["terminate_on_close"] is True
+            assert "max_sse_event_size" not in mock_http_client.call_args.kwargs
             mock_http_client.assert_called_once()
     finally:
         await tool.close()
     assert http_client.is_closed
+
+
+def _mcp_sdk_supports_max_sse_event_size() -> bool:
+    """Independent oracle: mcp 2.3.0 added the option together with its default constant."""
+    import mcp.client.streamable_http
+
+    return hasattr(mcp.client.streamable_http, "DEFAULT_MAX_SSE_EVENT_SIZE")
+
+
+_requires_mcp_max_sse_event_size = pytest.mark.skipif(
+    not _mcp_sdk_supports_max_sse_event_size(),
+    reason="max_sse_event_size requires mcp>=2.3.0",
+)
+
+
+def test_mcp_streamable_http_capability_check_matches_installed_mcp() -> None:
+    from agent_framework._mcp import _streamable_http_client_supports_max_sse_event_size
+
+    assert _streamable_http_client_supports_max_sse_event_size() is _mcp_sdk_supports_max_sse_event_size()
+
+
+@_requires_mcp_max_sse_event_size
+@pytest.mark.parametrize("max_sse_event_size", [4 * 1024 * 1024, None])
+async def test_mcp_streamable_http_tool_forwards_explicit_max_sse_event_size(max_sse_event_size: int | None) -> None:
+    tool = MCPStreamableHTTPTool(name="test", url="http://example.com", max_sse_event_size=max_sse_event_size)
+
+    try:
+        with patch("mcp.client.streamable_http.streamable_http_client") as mock_http_client:
+            tool.get_mcp_client()
+            assert mock_http_client.call_args.kwargs["max_sse_event_size"] == max_sse_event_size
+    finally:
+        await tool.close()
+
+
+@pytest.mark.parametrize("max_sse_event_size", [0, -1])
+def test_mcp_streamable_http_tool_rejects_non_positive_max_sse_event_size(max_sse_event_size: int) -> None:
+    with pytest.raises(ValueError, match="max_sse_event_size must be positive or None"):
+        MCPStreamableHTTPTool(name="test", url="http://example.com", max_sse_event_size=max_sse_event_size)
+
+
+def test_mcp_streamable_http_tool_reports_ownership_conflict_before_validating_max_sse_event_size() -> None:
+    with (
+        patch("agent_framework._mcp._load_streamable_http_client") as mock_loader,
+        pytest.raises(ValueError, match="`mcp_client` cannot be combined with framework-owned HTTP options"),
+    ):
+        MCPStreamableHTTPTool(name="test", mcp_client=Mock(), max_sse_event_size=0)
+    mock_loader.assert_not_called()
+
+
+@pytest.mark.parametrize("max_sse_event_size", [4 * 1024 * 1024, 1024 * 1024, None])
+def test_mcp_streamable_http_tool_rejects_max_sse_event_size_with_supplied_session(
+    max_sse_event_size: int | None,
+) -> None:
+    with pytest.raises(ValueError, match="`max_sse_event_size` .* cannot be combined with `session`"):
+        MCPStreamableHTTPTool(
+            name="test",
+            url="http://example.com",
+            session=Mock(spec=ClientSession),
+            max_sse_event_size=max_sse_event_size,
+            load_tools=False,
+            load_prompts=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "tool_options",
+    [
+        pytest.param({}, id="omitted"),
+        pytest.param({"max_sse_event_size": None}, id="explicit", marks=_requires_mcp_max_sse_event_size),
+    ],
+)
+def test_mcp_streamable_http_tool_with_max_sse_event_size_option_can_be_copied_and_pickled(
+    tool_options: dict[str, Any],
+) -> None:
+    import copy
+    import pickle
+
+    tool = MCPStreamableHTTPTool(name="test", url="http://example.com", **tool_options)
+
+    assert copy.deepcopy(tool)._transport_options == tool._transport_options
+    assert pickle.loads(pickle.dumps(tool))._transport_options == tool._transport_options
+
+
+@pytest.mark.parametrize("max_sse_event_size", [4 * 1024 * 1024, None])
+def test_mcp_streamable_http_tool_requires_mcp_support_for_explicit_max_sse_event_size(
+    max_sse_event_size: int | None,
+) -> None:
+    @contextlib.asynccontextmanager
+    async def streamable_http_client_without_option(  # ruff:ignore[unused-async]
+        url: str, *, http_client: Any = None, terminate_on_close: bool = True
+    ) -> AsyncGenerator[Any, None]:
+        yield None
+
+    with (
+        patch("agent_framework._mcp._load_streamable_http_client", return_value=streamable_http_client_without_option),
+        pytest.raises(ValueError, match=r"max_sse_event_size requires mcp>=2\.3\.0"),
+    ):
+        MCPStreamableHTTPTool(name="test", url="http://example.com", max_sse_event_size=max_sse_event_size)
+
+
+@pytest.mark.skipif(_mcp_sdk_supports_max_sse_event_size(), reason="exercises mcp releases before 2.3.0")
+@pytest.mark.parametrize("max_sse_event_size", [4 * 1024 * 1024, None])
+def test_mcp_streamable_http_tool_rejects_explicit_max_sse_event_size_on_older_mcp(
+    max_sse_event_size: int | None,
+) -> None:
+    with pytest.raises(ValueError, match=r"max_sse_event_size requires mcp>=2\.3\.0"):
+        MCPStreamableHTTPTool(name="test", url="http://example.com", max_sse_event_size=max_sse_event_size)
+
+
+async def test_mcp_streamable_http_tool_omitted_max_sse_event_size_needs_no_mcp_support_check() -> None:
+    with patch(
+        "agent_framework._mcp._load_streamable_http_client",
+        side_effect=ModuleNotFoundError("`MCPStreamableHTTPTool` requires `mcp`. Please install `mcp`."),
+    ):
+        tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
+        with pytest.raises(ModuleNotFoundError, match="requires `mcp`"):
+            MCPStreamableHTTPTool(name="test", url="http://example.com", max_sse_event_size=None)
+    await tool.close()
 
 
 async def test_mcp_tool_deduplication():
@@ -8929,6 +9048,9 @@ def test_mcp_streamable_http_rejects_header_provider_with_supplied_client() -> N
     [
         ("request_timeout", 31),
         ("terminate_on_close", False),
+        ("max_sse_event_size", 4 * 1024 * 1024),
+        ("max_sse_event_size", 1024 * 1024),
+        ("max_sse_event_size", None),
         ("http_client", Mock(spec=AsyncClient)),
         ("static_headers", {}),
     ],
@@ -8958,6 +9080,7 @@ def test_mcp_streamable_http_lists_all_framework_owned_http_options_with_supplie
             mcp_client=Mock(),
             request_timeout=31,
             terminate_on_close=False,
+            max_sse_event_size=None,
             http_client=Mock(spec=AsyncClient),
             static_headers={},
             header_provider=lambda _: {"Authorization": "******"},
@@ -8969,6 +9092,7 @@ def test_mcp_streamable_http_lists_all_framework_owned_http_options_with_supplie
     for option_name in (
         "request_timeout",
         "terminate_on_close",
+        "max_sse_event_size",
         "http_client",
         "static_headers",
         "header_provider",
@@ -11204,8 +11328,12 @@ def _make_mcp_protocol_server_mock(
     era: str,
     capabilities: Mapping[str, Any],
     endpoints: Mapping[str, _MCPProtocolEndpoint],
+    sse_methods: Collection[str] = (),
 ) -> tuple[MockTransport, list[tuple[dict[str, Any], dict[str, str]]]]:
-    """Create a protocol-era mock while keeping feature endpoints explicit in each test."""
+    """Create a protocol-era mock while keeping feature endpoints explicit in each test.
+
+    Responses to methods in ``sse_methods`` are sent as a single Server-Sent Event instead of a JSON body.
+    """
     if era not in {"modern", "legacy"}:
         raise ValueError(f"Unsupported MCP protocol era: {era}")
 
@@ -11252,6 +11380,12 @@ def _make_mcp_protocol_server_mock(
 
         response: dict[str, Any] = {"jsonrpc": "2.0", "id": body["id"]}
         response["error" if error is not None else "result"] = error if error is not None else result
+        if method in sse_methods:
+            return Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=f"event: message\ndata: {json.dumps(response)}\n\n".encode(),
+            )
         return Response(200, json=response)
 
     return MockTransport(handler), captured_requests
@@ -11309,6 +11443,87 @@ async def test_mcp_streamble_http_tool_connects_to_v2_server() -> None:
     assert headers["mcp-method"] == body["method"] == "tools/call"
     assert headers["mcp-name"] == params["name"] == "greet"
     assert isinstance(meta["io.modelcontextprotocol/clientCapabilities"], dict)
+
+
+def _make_sse_tool_result_server_mock(
+    text_size: int,
+) -> tuple[MockTransport, list[tuple[dict[str, Any], dict[str, str]]]]:
+    """Serve a ``tools/call`` result carrying ``text_size`` bytes of synthetic text as one SSE event."""
+    return _make_mcp_protocol_server_mock(
+        era="modern",
+        capabilities={"tools": {}},
+        endpoints={
+            "tools/list": {
+                "cacheScope": "private",
+                "resultType": "complete",
+                "ttlMs": 0,
+                "tools": [{"name": "fetch_report", "inputSchema": {"type": "object", "properties": {}}}],
+            },
+            "tools/call": {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "x" * text_size}],
+                "isError": False,
+            },
+        },
+        sse_methods={"tools/call"},
+    )
+
+
+@_requires_mcp_max_sse_event_size
+@pytest.mark.parametrize(
+    ("text_size", "tool_options"),
+    [
+        pytest.param(2 * 1024 * 1024, {}, id="mcp-default-limit"),
+        pytest.param(128 * 1024, {"max_sse_event_size": 64 * 1024}, id="configured-limit"),
+    ],
+)
+async def test_mcp_streamable_http_tool_rejects_sse_event_over_limit(
+    text_size: int,
+    tool_options: dict[str, Any],
+) -> None:
+    transport, captured_requests = _make_sse_tool_result_server_mock(text_size)
+    tool = MCPStreamableHTTPTool(
+        name="reports",
+        url="http://example.com/mcp",
+        http_client=AsyncClient(transport=transport),
+        **tool_options,
+    )
+
+    async with tool:
+        async with asyncio.timeout(10):
+            with pytest.raises(ToolExecutionException, match="SSE stream failed") as exc_info:
+                await tool.call_tool("fetch_report")
+
+    assert isinstance(exc_info.value.__cause__, MCPError)
+    tool_calls = [body for body, _ in captured_requests if body["method"] == "tools/call"]
+    assert len(tool_calls) == 1
+
+
+@_requires_mcp_max_sse_event_size
+@pytest.mark.parametrize(
+    "max_sse_event_size",
+    [pytest.param(None, id="limit-disabled"), pytest.param(4 * 1024 * 1024, id="limit-raised")],
+)
+async def test_mcp_streamable_http_tool_accepts_large_sse_event_within_configured_limit(
+    max_sse_event_size: int | None,
+) -> None:
+    text_size = 2 * 1024 * 1024
+    transport, captured_requests = _make_sse_tool_result_server_mock(text_size)
+    tool = MCPStreamableHTTPTool(
+        name="reports",
+        url="http://example.com/mcp",
+        http_client=AsyncClient(transport=transport),
+        max_sse_event_size=max_sse_event_size,
+    )
+
+    async with tool:
+        async with asyncio.timeout(10):
+            result = await tool.call_tool("fetch_report")
+
+    assert isinstance(result, list)
+    assert [item.text for item in result if item.type == "text"] == ["x" * text_size]
+    tool_calls = [body for body, _ in captured_requests if body["method"] == "tools/call"]
+    assert len(tool_calls) == 1
 
 
 async def test_mcp_streamable_http_tool_connects_to_legacy_server() -> None:

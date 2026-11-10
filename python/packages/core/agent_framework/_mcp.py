@@ -17,7 +17,7 @@ from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from http.cookiejar import CookieJar, DefaultCookiePolicy
-from inspect import currentframe, isawaitable
+from inspect import currentframe, isawaitable, signature
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, TypeAlias, TypedDict, TypeVar, cast
 
 if sys.version_info >= (3, 13):
@@ -30,6 +30,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import propagate
 from opentelemetry import trace as otel_trace
 from pydantic_core import to_jsonable_python
+from typing_extensions import Sentinel
 
 from ._feature_stage import (
     ExperimentalFeature,
@@ -258,6 +259,9 @@ _MCP_SUBSCRIPTION_RETRY_MAX_DELAY = 2.0
 _DEFAULT_MCP_DISCOVERY_MAX_PAGES = 100
 _DEFAULT_MCP_DISCOVERY_MAX_ITEMS = 1_000
 _DEFAULT_MCP_HOST_PAYLOAD_SIZE_BYTES = 1024 * 1024
+# Distinguish an omitted ``max_sse_event_size`` (keep the installed MCP SDK's default) from an explicit
+# ``None`` (disable the limit).
+_UNSET_MAX_SSE_EVENT_SIZE: Any = Sentinel("_UNSET_MAX_SSE_EVENT_SIZE")
 
 
 @dataclass
@@ -1080,8 +1084,8 @@ def _mcp_header_identity(headers: Mapping[str, str]) -> _MCPHeaderIdentity:
     return tuple(sorted(normalized.items()))
 
 
-def streamable_http_client(*args: Any, **kwargs: Any) -> _AsyncGeneratorContextManager[Any, None]:
-    """Lazily import the MCP streamable HTTP transport."""
+def _load_streamable_http_client() -> Callable[..., _AsyncGeneratorContextManager[Any, None]]:
+    """Lazily import and return the MCP SDK's streamable HTTP transport factory."""
     try:
         from mcp.client.streamable_http import streamable_http_client as _streamable_http_client
     except ModuleNotFoundError as ex:
@@ -1093,7 +1097,21 @@ def streamable_http_client(*args: Any, **kwargs: Any) -> _AsyncGeneratorContextM
             f"The optional dependency `{missing_name}` is not installed. Please update your dependencies."
         ) from ex
 
-    return _streamable_http_client(*args, **kwargs)
+    return _streamable_http_client
+
+
+def streamable_http_client(*args: Any, **kwargs: Any) -> _AsyncGeneratorContextManager[Any, None]:
+    """Lazily import the MCP streamable HTTP transport."""
+    return _load_streamable_http_client()(*args, **kwargs)
+
+
+def _streamable_http_client_supports_max_sse_event_size() -> bool:
+    """Return whether the installed MCP SDK accepts ``max_sse_event_size`` (added in mcp 2.3.0).
+
+    The SDK's own signature is checked rather than its version string, so no version parser is needed and
+    the answer reflects the callable that will actually run.
+    """
+    return "max_sse_event_size" in signature(_load_streamable_http_client()).parameters
 
 
 def _should_propagate_cancelled_error(ex: BaseException) -> bool:
@@ -4303,6 +4321,7 @@ class MCPStreamableHTTPTool(MCPTool):
         use_progressive_disclosure: bool = False,
         always_load: Collection[str] | None = None,
         terminate_on_close: bool | None = None,
+        max_sse_event_size: int | None = _UNSET_MAX_SSE_EVENT_SIZE,
         client: SupportsChatGetResponse | None = None,
         sampling_approval_callback: SamplingApprovalCallback | None = None,
         sampling_max_tokens: int | None = _DEFAULT_SAMPLING_MAX_TOKENS,
@@ -4359,10 +4378,10 @@ class MCPStreamableHTTPTool(MCPTool):
                 Caller-owned clients retain their own request timeout policy.
             mcp_client: An already-entered high-level MCP ``Client`` to use. The caller retains ownership;
                 closing or resetting this wrapper does not close or replace that client. Mutually exclusive
-                with ``url`` and ``session``. ``request_timeout``, ``terminate_on_close``, ``http_client``,
-                ``static_headers``, and ``header_provider`` configure framework-owned HTTP construction and
-                cannot be supplied with ``mcp_client``. Sampling options configured on this wrapper do not
-                modify the supplied Client.
+                with ``url`` and ``session``. ``request_timeout``, ``terminate_on_close``,
+                ``max_sse_event_size``, ``http_client``, ``static_headers``, and ``header_provider`` configure
+                framework-owned HTTP construction and cannot be supplied with ``mcp_client``. Sampling options
+                configured on this wrapper do not modify the supplied Client.
             session: A deprecated low-level MCP ``ClientSession`` compatibility path. Prefer ``mcp_client`` for new
                 usage. The caller retains ownership; closing or resetting this wrapper does not close or replace
                 that session. Sampling options configured on this wrapper do not modify the supplied session.
@@ -4397,6 +4416,12 @@ class MCPStreamableHTTPTool(MCPTool):
                 entries are ignored.
             additional_properties: Additional properties.
             terminate_on_close: Close the transport when the MCP client is terminated.
+            max_sse_event_size: Maximum size in bytes of one Server-Sent Event received from the server.
+                When omitted, the installed MCP SDK's default applies (1 MiB in mcp 2.3.0). ``None``
+                disables the limit for a trusted server; raising it increases the memory a single event may
+                use. JSON responses are not affected, and this is independent of
+                ``max_host_payload_size_bytes``. Supplying a value requires ``mcp>=2.3.0``, which is checked
+                at construction, and cannot be combined with ``mcp_client`` or the deprecated ``session``.
             client: The chat client to use for sampling.
             sampling_approval_callback: Optional gate run before each server-initiated
                 ``sampling/createMessage`` request reaches ``client``. Receives the raw
@@ -4533,6 +4558,7 @@ class MCPStreamableHTTPTool(MCPTool):
                         request_timeout not in (None, _MCP_DEFAULT_READ_TIMEOUT_SECONDS),
                     ),
                     ("terminate_on_close", terminate_on_close is not None),
+                    ("max_sse_event_size", max_sse_event_size is not _UNSET_MAX_SSE_EVENT_SIZE),
                     ("http_client", http_client is not None),
                     ("static_headers", static_headers is not None),
                     ("header_provider", header_provider is not None),
@@ -4545,6 +4571,23 @@ class MCPStreamableHTTPTool(MCPTool):
                     f"`mcp_client` cannot be combined with framework-owned HTTP options: {formatted_options}. "
                     "Configure these settings on the supplied Client instead."
                 )
+        # Only an explicit value is forwarded, so an omitted option keeps working on mcp releases without it.
+        # The sentinel itself is not kept on the instance: typing-extensions<4.16 sentinels cannot be copied.
+        transport_options: dict[str, Any] = {}
+        if max_sse_event_size is not _UNSET_MAX_SSE_EVENT_SIZE:
+            if session is not None:
+                raise ValueError(
+                    "`max_sse_event_size` configures framework-owned HTTP construction and cannot be combined "
+                    "with `session`, whose transport is caller-owned."
+                )
+            if max_sse_event_size is not None and max_sse_event_size <= 0:
+                raise ValueError("max_sse_event_size must be positive or None.")
+            if not _streamable_http_client_supports_max_sse_event_size():
+                raise ValueError(
+                    "max_sse_event_size requires mcp>=2.3.0; the installed mcp does not support it. "
+                    "Upgrade mcp or omit max_sse_event_size."
+                )
+            transport_options["max_sse_event_size"] = max_sse_event_size
 
         super().__init__(
             name=name,
@@ -4575,6 +4618,7 @@ class MCPStreamableHTTPTool(MCPTool):
         )
         self.url = url
         self.terminate_on_close = terminate_on_close
+        self._transport_options = transport_options
         self._httpx_client: httpx2.AsyncClient | None = http_client
         self._static_headers = dict(static_headers or {})
         self._header_provider = header_provider
@@ -4739,6 +4783,7 @@ class MCPStreamableHTTPTool(MCPTool):
             url=self.url,
             http_client=transport_http_client,
             terminate_on_close=self.terminate_on_close if self.terminate_on_close is not None else True,
+            **self._transport_options,
         )
 
     async def _close_owned_http_client(self, http_client: httpx2.AsyncClient) -> None:

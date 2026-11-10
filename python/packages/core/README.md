@@ -218,6 +218,29 @@ not cancel another caller's active operation. Cleanup may continue after a timeo
 or cancellation so the lifecycle owner can finish releasing resources safely.
 Caller-owned MCP clients retain their own RPC timeout policy and are not recreated.
 
+### MCP SSE event size
+
+The MCP SDK limits one Server-Sent Event to 1 MiB by default (mcp 2.3.0), so a larger
+tool result streamed as SSE fails with a `ToolExecutionException` (`SSE stream failed`).
+Use `max_sse_event_size` to raise the limit, or pass `None` to disable it for a trusted server:
+
+```python
+from agent_framework import MCPStreamableHTTPTool
+
+tool = MCPStreamableHTTPTool(
+    name="reports",
+    url="https://example.com/mcp",
+    max_sse_event_size=8 * 1024 * 1024,
+)
+```
+
+Omitting the option keeps the SDK default and works with every supported `mcp` version.
+An explicit value requires `mcp>=2.3.0`; with an older `mcp`, construction raises a
+`ValueError`. The limit applies to SSE responses only, not JSON responses, and is
+independent of `max_host_payload_size_bytes`. One event carries the whole JSON-RPC
+response, which can hold the result twice (`content` and `structuredContent`), so size
+the limit for the full message. A higher limit lets a single event use more memory.
+
 Concurrent failures of the same connection share its replacement. Calling `close()`
 interrupts older recovery so it cannot reopen the connection or retry the failed
 operation after shutdown. A later explicit `connect()` remains supported.
